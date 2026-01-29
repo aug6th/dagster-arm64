@@ -1,0 +1,110 @@
+name: Auto Build and Push Dagster ARM64 Image
+
+on:
+  schedule:
+    # Run daily at 00:00 UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    # Allow manual trigger for testing
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get latest Dagster version from PyPI
+        id: pypi
+        run: |
+          LATEST_VERSION=$(curl -s https://pypi.org/pypi/dagster/json | jq -r '.info.version')
+          echo "Latest Dagster version: $LATEST_VERSION"
+          echo "version=$LATEST_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check if image already exists in GHCR
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.pypi.outputs.version }}"
+          REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE_NAME="ghcr.io/${REPO_OWNER}/dagster-arm64"
+          
+          echo "Checking for image: ${IMAGE_NAME}:${VERSION}"
+          
+          # Try to get the manifest for the specific version tag
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $(echo $GITHUB_TOKEN | base64)" \
+            -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+            "https://ghcr.io/v2/${REPO_OWNER}/dagster-arm64/manifests/${VERSION}")
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "Image already exists for version $VERSION"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Image does not exist for version $VERSION (HTTP: $HTTP_CODE)"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up QEMU
+        if: steps.check.outputs.exists == 'false'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.exists == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: steps.check.outputs.exists == 'false'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        if: steps.check.outputs.exists == 'false'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/dagster-arm64
+          tags: |
+            type=raw,value=${{ steps.pypi.outputs.version }}
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        if: steps.check.outputs.exists == 'false'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            DAGSTER_VERSION=${{ steps.pypi.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          VERSION="${{ steps.pypi.outputs.version }}"
+          EXISTS="${{ steps.check.outputs.exists }}"
+          
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Latest Dagster Version**: $VERSION" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$EXISTS" = "true" ]; then
+            echo "- **Status**: ✅ Image already exists, skipped build" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Status**: 🚀 New image built and pushed" >> $GITHUB_STEP_SUMMARY
+            echo "- **Tags**: \`$VERSION\`, \`latest\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Platform**: \`linux/arm64\`" >> $GITHUB_STEP_SUMMARY
+          fi

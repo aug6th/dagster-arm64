@@ -1,0 +1,101 @@
+name: Manual Push to ECR
+
+on:
+  workflow_dispatch:
+    inputs:
+      dagster_version:
+        description: 'Dagster version to build (leave empty for latest from PyPI)'
+        required: false
+        type: string
+      aws_region:
+        description: 'AWS Region'
+        required: false
+        default: 'ap-northeast-2'
+        type: string
+
+permissions:
+  contents: read
+  id-token: write  # Required for AWS OIDC
+
+jobs:
+  build-and-push-ecr:
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID || '676499404107' }}
+      AWS_REGION: ${{ inputs.aws_region || 'ap-northeast-2' }}
+      ECR_REPOSITORY: 'aha-ai/dagster-celery-k8s'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get Dagster version
+        id: version
+        run: |
+          if [ -n "${{ inputs.dagster_version }}" ]; then
+            VERSION="${{ inputs.dagster_version }}"
+            echo "Using specified version: $VERSION"
+          else
+            VERSION=$(curl -s https://pypi.org/pypi/dagster/json | jq -r '.info.version')
+            echo "Using latest PyPI version: $VERSION"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create ECR repository if not exists
+        run: |
+          aws ecr describe-repositories \
+            --repository-names ${{ env.ECR_REPOSITORY }} \
+            --region ${{ env.AWS_REGION }} 2>/dev/null || \
+          aws ecr create-repository \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --region ${{ env.AWS_REGION }} \
+            --image-scanning-configuration scanOnPush=true
+
+      - name: Build and push to ECR
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.version }}
+            ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest
+          build-args: |
+            DAGSTER_VERSION=${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ECR_URI="${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}"
+          
+          echo "## ECR Push Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Dagster Version**: $VERSION" >> $GITHUB_STEP_SUMMARY
+          echo "- **ECR Repository**: $ECR_URI" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tags**: \`$VERSION\`, \`latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Platform**: \`linux/arm64\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Pull Command" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "docker pull $ECR_URI:$VERSION" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
